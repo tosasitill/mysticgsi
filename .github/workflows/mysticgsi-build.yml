@@ -25,11 +25,6 @@ on:
         required: false
         default: ""
         type: string
-      compress:
-        description: "Also create a ZIP containing system.img"
-        required: true
-        default: true
-        type: boolean
       no_debloat:
         description: "Keep apps normally removed by the patch set"
         required: true
@@ -95,7 +90,6 @@ jobs:
           FIRMWARE_URL: ${{ inputs.firmware_url }}
           ROM_TYPE: ${{ inputs.rom_type }}
           VARIANT_TAG: ${{ inputs.variant_tag }}
-          COMPRESS: ${{ inputs.compress }}
           NO_DEBLOAT: ${{ inputs.no_debloat }}
         shell: bash
         run: |
@@ -107,9 +101,9 @@ jobs:
           if [[ -n "$VARIANT_TAG" ]]; then
             args+=(--add "$VARIANT_TAG")
           fi
-          if [[ "$COMPRESS" == "true" ]]; then
-            args+=(--compress)
-          fi
+          # The workflow publishes only the ZIP, so always create it.  The
+          # image remains an intermediate build product on the runner.
+          args+=(--compress)
           if [[ "$NO_DEBLOAT" == "true" ]]; then
             args+=(--no-debloat)
           fi
@@ -126,9 +120,9 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          images=(out/*/*.img)
-          if (( ${#images[@]} == 0 )); then
-            echo "No system image was produced under out/" >&2
+          archives=(out/*/*.zip)
+          if (( ${#archives[@]} == 0 )); then
+            echo "No ZIP archive was produced under out/" >&2
             find out -maxdepth 3 -type f -print 2>/dev/null || true
             exit 1
           fi
@@ -140,10 +134,10 @@ jobs:
           : > "$original_checksums"
 
           # Release assets are limited to less than 2 GiB each.  Keep the
-          # original files for workflow artifacts, but split oversized files
+          # original ZIP for the workflow artifact, but split oversized files
           # into 1900 MiB parts for the release.  The fixed-width suffix keeps
           # shell glob ordering stable when the file is reassembled.
-          outputs=(out/*/*.img out/*/*.zip)
+          outputs=(out/*/*.zip)
           for source in "${outputs[@]}"; do
             [[ -f "$source" ]] || continue
             name=$(basename "$source")
@@ -167,9 +161,9 @@ jobs:
           cat > release/REASSEMBLE.md <<'EOF'
           # Reassembling large output files
 
-          GitHub Release limits an individual asset to 2 GiB, so large
-          `system.img`/`.zip` files are published as `.part.000`, `.part.001`,
-          and so on.  Download all parts for a file into one directory and run:
+          GitHub Release limits an individual asset to 2 GiB, so a large ZIP
+          is published as `.part.000`, `.part.001`, and so on.  Download all
+          parts into one directory and run:
 
           ```sh
           cat 'FILE.part.'* > 'FILE'
@@ -207,31 +201,17 @@ jobs:
             cat release/SHA256SUMS
             echo '```'
             echo
-            echo "Large image/archive files are split into 1900 MiB parts for the GitHub Release asset limit."
+            echo "Large ZIP files are split into 1900 MiB parts for the GitHub Release asset limit."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Produced files:"
           du -h release/*
 
-      # upload-artifact has a roughly 10 GB limit per artifact.  Upload the
-      # original image and ZIP as separate artifacts instead of combining them
-      # (which would exceed that limit for large builds).  If the repository's
-      # artifact quota is exhausted, keep going so the split Release is still
-      # published.
-      - name: Upload system image artifact
-        id: upload_image
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: mysticgsi-${{ inputs.build_name }}-system-img-${{ github.run_id }}
-          path: out/*/*.img
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
-
+      # Upload only the original ZIP as a workflow artifact.  If the
+      # repository's artifact quota or per-artifact limit is exhausted, keep
+      # going so the split Release is still published.
       - name: Upload ZIP artifact
         id: upload_zip
-        if: ${{ inputs.compress == true }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -244,19 +224,12 @@ jobs:
       - name: Report artifact upload status
         if: always()
         env:
-          IMAGE_STATUS: ${{ steps.upload_image.outcome }}
           ZIP_STATUS: ${{ steps.upload_zip.outcome }}
-          COMPRESS: ${{ inputs.compress }}
         shell: bash
         run: |
           {
             echo "### Workflow artifact uploads"
-            echo "- system.img artifact: ${IMAGE_STATUS}"
-            if [[ "$COMPRESS" == "true" ]]; then
-              echo "- ZIP artifact: ${ZIP_STATUS}"
-            else
-              echo "- ZIP artifact: not requested"
-            fi
+            echo "- ZIP artifact: ${ZIP_STATUS}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set release metadata
@@ -283,6 +256,7 @@ jobs:
             - Source commit: [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
             - Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
-            The release contains `system.img` (and, when requested, the ZIP
-            archive) either directly or as 1900 MiB `.part.*` files, together
-            with `REASSEMBLE.md`, `output.txt`, and SHA-256 manifests.
+            The release contains the ZIP archive either directly or as 1900
+            MiB `.part.*` files, together with `REASSEMBLE.md`, `output.txt`,
+            and SHA-256 manifests. `system.img` is kept as an intermediate
+            build product and is not uploaded.

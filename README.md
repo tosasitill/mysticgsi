@@ -164,15 +164,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 The **MysticGSI - Build** workflow can build and publish a GSI without a local
 Linux environment.  Open the repository's **Actions** tab, select the workflow,
 click **Run workflow**, and provide a publicly reachable firmware URL.  The
-workflow accepts the same ROM type, variant, compression, and debloating
-options as the command-line interface.
+workflow accepts the same ROM type, variant, and debloating options as the
+command-line interface; ZIP creation is always enabled for the upload.
 
 It prepares the host with `setup_host.py`, removes unused software from the
 runner to make room for large firmware archives, and adds swap space for image
-creation.  The generated `system.img` and optional ZIP are uploaded as
-separate workflow artifacts.  GitHub Releases limit each asset to 2 GiB, so
-larger files are automatically split into 1900 MiB parts; download all parts
-and follow `REASSEMBLE.md` to restore the original file.  Build information and
+creation.  Only the generated ZIP is uploaded.  GitHub Releases limit each
+asset to 2 GiB, so larger ZIP files are automatically split into 1900 MiB
+parts; download all parts and follow `REASSEMBLE.md` to restore the original
+file.  The intermediate `system.img` is not uploaded.  Build information and
 SHA-256 manifests are included in the release as well.
 
 Patch files of 50 MiB or more are stored xz-compressed (`<name>.xz`) and unpacked during builds. After adding one, run `./tools/assets.py pack` and commit the `.xz` files (or `.xz.000`, `.xz.001`, ... for split archives).  
