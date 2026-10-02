@@ -3,6 +3,7 @@
 
 tmp
 out
+/release
 
 /*.zip
 /*.aria2

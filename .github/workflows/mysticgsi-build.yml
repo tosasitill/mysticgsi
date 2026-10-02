@@ -1,0 +1,203 @@
+name: MysticGSI - Build
+
+# Build a GSI from a publicly reachable stock firmware archive.  The build is
+# intentionally manual: firmware archives are large and are not suitable for
+# storing in the repository or passing as workflow artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: "Name used for the temporary and output directories"
+        required: true
+        default: "mysticgsi"
+        type: string
+      firmware_url:
+        description: "Public URL of the stock firmware archive"
+        required: true
+        type: string
+      rom_type:
+        description: "ROM type override (auto, generic, custom, or a supported patch name)"
+        required: true
+        default: "auto"
+        type: string
+      variant_tag:
+        description: "Optional variant tag appended to the build name"
+        required: false
+        default: ""
+        type: string
+      compress:
+        description: "Also create a ZIP containing system.img"
+        required: true
+        default: true
+        type: boolean
+      no_debloat:
+        description: "Keep apps normally removed by the patch set"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mysticgsi-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ inputs.build_name }}
+    # slimhub_actions supports the current Ubuntu images explicitly.  Pinning
+    # the image avoids an unexpected runner change during a long build.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # A stock firmware can expand to many gigabytes.  Remove unused
+      # preinstalled software before downloading it, as in the OrangeFox
+      # builder, then add swap for filesystem/image creation.
+      - name: Free runner disk space
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Add swap space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      - name: Show runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Memory and swap:"
+          free -h
+          swapon --show || true
+          echo
+          echo "Filesystem capacity:"
+          df -h "${GITHUB_WORKSPACE}"
+
+      - name: Install build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./setup_host.py
+          .venv/bin/python -c 'import tools; tools.check_environment()'
+
+      - name: Build GSI
+        env:
+          BUILD_NAME: ${{ inputs.build_name }}
+          FIRMWARE_URL: ${{ inputs.firmware_url }}
+          ROM_TYPE: ${{ inputs.rom_type }}
+          VARIANT_TAG: ${{ inputs.variant_tag }}
+          COMPRESS: ${{ inputs.compress }}
+          NO_DEBLOAT: ${{ inputs.no_debloat }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Use an array so URLs containing '?', '&', or '=' are passed to
+          # Python as one argument and never interpreted by the shell.
+          args=(build "$BUILD_NAME" "$FIRMWARE_URL" --type "$ROM_TYPE")
+          if [[ -n "$VARIANT_TAG" ]]; then
+            args+=(--add "$VARIANT_TAG")
+          fi
+          if [[ "$COMPRESS" == "true" ]]; then
+            args+=(--compress)
+          fi
+          if [[ "$NO_DEBLOAT" == "true" ]]; then
+            args+=(--no-debloat)
+          fi
+
+          .venv/bin/python cli.py "${args[@]}"
+
+      - name: Collect and verify outputs
+        env:
+          BUILD_NAME: ${{ inputs.build_name }}
+          ROM_TYPE: ${{ inputs.rom_type }}
+          VARIANT_TAG: ${{ inputs.variant_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          images=(out/*/*.img)
+          if (( ${#images[@]} == 0 )); then
+            echo "No system image was produced under out/" >&2
+            find out -maxdepth 3 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          rm -rf release
+          mkdir -p release
+          for pattern in 'out/*/*.img' 'out/*/*.zip' 'out/*/output.txt'; do
+            for file in $pattern; do
+              [[ -f "$file" ]] || continue
+              cp -- "$file" release/
+            done
+          done
+
+          # Write the checksum list outside release first so SHA256SUMS does
+          # not accidentally contain a checksum of itself.
+          checksums=$(mktemp)
+          (cd release && sha256sum -- *) > "$checksums"
+          mv -- "$checksums" release/SHA256SUMS
+          {
+            echo "### MysticGSI build"
+            echo
+            echo "- Build name: \`$BUILD_NAME\`"
+            echo "- ROM type: \`$ROM_TYPE\`"
+            if [[ -n "$VARIANT_TAG" ]]; then
+              echo "- Variant: \`$VARIANT_TAG\`"
+            fi
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "Files (with SHA-256 checksums):"
+            echo
+            echo '```text'
+            cat release/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Produced files:"
+          du -h release/*
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysticgsi-${{ inputs.build_name }}-${{ github.run_id }}
+          path: release
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Set release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "BUILD_DATE=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=mysticgsi-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          name: MysticGSI ${{ inputs.build_name }} // ${{ env.BUILD_DATE }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            ## MysticGSI GSI build
+
+            - Build name: `${{ inputs.build_name }}`
+            - ROM type: `${{ inputs.rom_type }}`
+            - Variant: `${{ inputs.variant_tag || 'default' }}`
+            - Source commit: [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+            - Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            The release contains the generated `system.img` (and, when
+            requested, the ZIP archive), `output.txt`, and `SHA256SUMS`.
