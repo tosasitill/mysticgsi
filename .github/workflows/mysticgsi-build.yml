@@ -135,17 +135,61 @@ jobs:
 
           rm -rf release
           mkdir -p release
-          for pattern in 'out/*/*.img' 'out/*/*.zip' 'out/*/output.txt'; do
-            for file in $pattern; do
-              [[ -f "$file" ]] || continue
-              cp -- "$file" release/
-            done
+          max_part_bytes=$((1900 * 1024 * 1024))
+          original_checksums=$(mktemp)
+          : > "$original_checksums"
+
+          # Release assets are limited to less than 2 GiB each.  Keep the
+          # original files for workflow artifacts, but split oversized files
+          # into 1900 MiB parts for the release.  The fixed-width suffix keeps
+          # shell glob ordering stable when the file is reassembled.
+          outputs=(out/*/*.img out/*/*.zip)
+          for source in "${outputs[@]}"; do
+            [[ -f "$source" ]] || continue
+            name=$(basename "$source")
+            sha256sum -- "$source" | awk -v name="$name" '{print $1 "  " name}' >> "$original_checksums"
+            file_size=$(wc -c < "$source")
+            if (( file_size > max_part_bytes )); then
+              split -b 1900M -d -a 4 -- "$source" "release/${name}.part."
+            else
+              cp -- "$source" "release/${name}"
+            fi
           done
 
-          # Write the checksum list outside release first so SHA256SUMS does
-          # not accidentally contain a checksum of itself.
+          for file in out/*/output.txt; do
+            [[ -f "$file" ]] || continue
+            cp -- "$file" release/
+          done
+
+          # This manifest is checked after concatenating any .part.* files.
+          cp -- "$original_checksums" release/SHA256SUMS.reassembled
+
+          cat > release/REASSEMBLE.md <<'EOF'
+          # Reassembling large output files
+
+          GitHub Release limits an individual asset to 2 GiB, so large
+          `system.img`/`.zip` files are published as `.part.000`, `.part.001`,
+          and so on.  Download all parts for a file into one directory and run:
+
+          ```sh
+          cat 'FILE.part.'* > 'FILE'
+          sha256sum -c SHA256SUMS.reassembled
+          ```
+
+          Replace `FILE` with the original filename shown in
+          `SHA256SUMS.reassembled`.
+          EOF
+
+          # Write the release-asset checksum list outside release first so
+          # SHA256SUMS does not accidentally contain a checksum of itself.
           checksums=$(mktemp)
-          (cd release && sha256sum -- *) > "$checksums"
+          (
+            cd release
+            for file in *; do
+              [[ "$file" == "SHA256SUMS" ]] && continue
+              sha256sum -- "$file"
+            done
+          ) > "$checksums"
           mv -- "$checksums" release/SHA256SUMS
           {
             echo "### MysticGSI build"
@@ -157,23 +201,63 @@ jobs:
             fi
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo
-            echo "Files (with SHA-256 checksums):"
+            echo "Release files (with SHA-256 checksums):"
             echo
             echo '```text'
             cat release/SHA256SUMS
             echo '```'
+            echo
+            echo "Large image/archive files are split into 1900 MiB parts for the GitHub Release asset limit."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Produced files:"
           du -h release/*
 
-      - name: Upload workflow artifact
+      # upload-artifact has a roughly 10 GB limit per artifact.  Upload the
+      # original image and ZIP as separate artifacts instead of combining them
+      # (which would exceed that limit for large builds).  If the repository's
+      # artifact quota is exhausted, keep going so the split Release is still
+      # published.
+      - name: Upload system image artifact
+        id: upload_image
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: mysticgsi-${{ inputs.build_name }}-${{ github.run_id }}
-          path: release
+          name: mysticgsi-${{ inputs.build_name }}-system-img-${{ github.run_id }}
+          path: out/*/*.img
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
+
+      - name: Upload ZIP artifact
+        id: upload_zip
+        if: ${{ inputs.compress == true }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysticgsi-${{ inputs.build_name }}-zip-${{ github.run_id }}
+          path: out/*/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Report artifact upload status
+        if: always()
+        env:
+          IMAGE_STATUS: ${{ steps.upload_image.outcome }}
+          ZIP_STATUS: ${{ steps.upload_zip.outcome }}
+          COMPRESS: ${{ inputs.compress }}
+        shell: bash
+        run: |
+          {
+            echo "### Workflow artifact uploads"
+            echo "- system.img artifact: ${IMAGE_STATUS}"
+            if [[ "$COMPRESS" == "true" ]]; then
+              echo "- ZIP artifact: ${ZIP_STATUS}"
+            else
+              echo "- ZIP artifact: not requested"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set release metadata
         shell: bash
@@ -199,5 +283,6 @@ jobs:
             - Source commit: [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
             - Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
-            The release contains the generated `system.img` (and, when
-            requested, the ZIP archive), `output.txt`, and `SHA256SUMS`.
+            The release contains `system.img` (and, when requested, the ZIP
+            archive) either directly or as 1900 MiB `.part.*` files, together
+            with `REASSEMBLE.md`, `output.txt`, and SHA-256 manifests.
